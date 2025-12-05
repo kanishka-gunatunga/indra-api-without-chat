@@ -64,7 +64,47 @@ export const handleServiceIntake = async (req: Request, res: Response) => {
     }
 };
 
+// export const createAssignToSale = async (req: Request, res: Response) => {
+//     try {
+//         const {
+//             customer_id,
+//             vehicle_id,
+//             vehicle_make,
+//             vehicle_model,
+//             year_of_manufacture,
+//             service_category,
+//             additional_note,
+//             lead_source,
+//             priority,
+//         } = req.body;
+//
+//         const ticket_number = `ISP${Date.now()}`;
+//
+//         const newSale = await ServiceParkSale.create({
+//             ticket_number,
+//             date: new Date(),
+//             customer_id,
+//             vehicle_id,
+//             vehicle_make,
+//             vehicle_model,
+//             service_category,
+//             year_of_manufacture,
+//             additional_note,
+//             lead_source,
+//             priority,
+//             status: "NEW",
+//         });
+//
+//         res.status(201).json({message: "Sale assigned", sale: newSale});
+//     } catch (error) {
+//         console.error(error);
+//         res.status(500).json({error: "Failed to create assign-to-sale"});
+//     }
+// };
+
+
 export const createAssignToSale = async (req: Request, res: Response) => {
+    const t = await db.sequelize.transaction();
     try {
         const {
             customer_id,
@@ -76,25 +116,117 @@ export const createAssignToSale = async (req: Request, res: Response) => {
             additional_note,
             lead_source,
             priority,
+
+            customer_name,
+            contact_number,
+            email,
+            city,
+            vehicle_type,
+            is_self_assigned,
+            sales_user_id,
+            remark
         } = req.body;
 
-        const ticket_number = `ISP${Date.now()}`;
+        let finalCustomerId = customer_id;
+        let finalVehicleId = vehicle_id;
+
+        if (is_self_assigned && !customer_id){
+            let customer = await Customer.findOne({where: {phone_number: contact_number}, transaction: t});
+            if (!customer) {
+                customer = await Customer.create({
+                    id: `CUS${Date.now()}`,
+                    customer_name,
+                    phone_number: contact_number,
+                    email,
+                    city,
+                    lead_source: lead_source || "Direct Walk-in"
+                } as any, { transaction: t });
+            }
+
+            finalCustomerId = customer.id;
+
+            const tempVehicleNo = `TEMP-${Date.now()}`;
+
+            const vehicle = await ServiceParkVehicleHistory.create({
+                vehicle_no: tempVehicleNo,
+                customer_id: finalCustomerId,
+                // Map simplified fields. Note: Your VehicleHistory model has owner_name, contact_no fields
+                // that are separate from the Customer model.
+                owner_name: customer_name,
+                contact_no: contact_number,
+                odometer: 0, // Mandatory field, default to 0
+                created_by: sales_user_id,
+                // You might want to add 'make' and 'model' to VehicleHistory attributes if not present,
+                // or just store them in the Sale record as snapshots.
+            }, { transaction: t });
+
+            finalVehicleId = vehicle.id;
+        }
+
+        let status: "NEW" | "ONGOING" = "NEW";
+        let assignedId: number | null = null;
+        let currentLevel: 1 | 2 | 3 = 1;
+
+        if (is_self_assigned && sales_user_id) {
+            status = "ONGOING";
+            assignedId = sales_user_id;
+            const salesUser = await User.findByPk(sales_user_id);
+            if (salesUser) {
+                currentLevel = getLevelFromRole(salesUser.user_role) as 1 | 2 | 3;
+            }
+        }
 
         const newSale = await ServiceParkSale.create({
-            ticket_number,
+            ticket_number: `ISP${Date.now()}`,
             date: new Date(),
-            customer_id,
-            vehicle_id,
-            vehicle_make,
-            vehicle_model,
-            service_category,
-            year_of_manufacture,
-            additional_note,
-            lead_source,
-            priority,
-            status: "NEW",
-        });
+            customer_id: finalCustomerId,
+            vehicle_id: finalVehicleId,
 
+            // Snapshot details for the sale table
+            vehicle_make: vehicle_make || "Unknown",
+            vehicle_model: vehicle_model || "Unknown",
+            year_of_manufacture: year_of_manufacture || new Date().getFullYear(),
+            service_category: service_category || "General",
+
+            additional_note: additional_note || remark, // Mapped from remark
+            lead_source,
+            priority: priority || 0,
+
+            status,
+            sales_user_id: assignedId,
+            current_level: currentLevel
+        }, { transaction: t });
+
+        if (assignedId && db.ServiceParkSaleHistory) {
+            await db.ServiceParkSaleHistory.create({
+                service_park_sale_id: newSale.id,
+                action_by: assignedId,
+                action_type: "CREATED_AND_SELF_ASSIGNED",
+                previous_level: 0,
+                new_level: currentLevel,
+                details: `Lead created and self-assigned by Sales Agent`,
+                timestamp: new Date()
+            } as any, { transaction: t });
+        }
+
+        // const ticket_number = `ISP${Date.now()}`;
+        //
+        // const newSale = await ServiceParkSale.create({
+        //     ticket_number,
+        //     date: new Date(),
+        //     customer_id,
+        //     vehicle_id,
+        //     vehicle_make,
+        //     vehicle_model,
+        //     service_category,
+        //     year_of_manufacture,
+        //     additional_note,
+        //     lead_source,
+        //     priority,
+        //     status: "NEW",
+        // });
+
+        await t.commit();
         res.status(201).json({message: "Sale assigned", sale: newSale});
     } catch (error) {
         console.error(error);

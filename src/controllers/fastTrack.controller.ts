@@ -1141,3 +1141,133 @@ export const getSaleFollowups = async (req: Request, res: Response) => {
         return res.status(http.INTERNAL_SERVER_ERROR).json({message: "Server error"});
     }
 };
+
+
+
+
+export const createSaleDirect = async (req: Request, res: Response) => {
+    const t = await db.sequelize.transaction();
+    try {
+        const {
+            // Customer Info
+            customer_name,
+            contact_number,
+            email,
+            city,
+
+            // Vehicle Interest
+            vehicle_make,
+            vehicle_model,
+            vehicle_type,
+
+            // Meta
+            lead_source,
+            additional_note,
+            priority,
+            sales_user_id,
+            is_self_assigned
+        } = req.body;
+
+        if (!is_self_assigned || !sales_user_id) {
+            await t.rollback();
+            return res.status(http.BAD_REQUEST).json({ message: "Invalid request: Missing user ID or flag" });
+        }
+
+        // 1. Find or Create Customer
+        let customer = await Customer.findOne({ where: { phone_number: contact_number }, transaction: t });
+        if (!customer) {
+            customer = await Customer.create({
+                id: `CUS${Date.now()}`,
+                customer_name,
+                phone_number: contact_number,
+                email,
+                city,
+                lead_source: lead_source || "Direct"
+            }, { transaction: t });
+        }
+
+        // 2. Create Placeholder Direct Request
+        // We need a request ID for the Sale table. We mark it 'ASSIGNED' immediately.
+        const dummyRequest = await FastTrackRequest.create({
+            customer_id: customer.id,
+            vehicle_type: vehicle_type || "Unknown",
+            vehicle_make,
+            vehicle_model,
+            status: "ASSIGNED",
+            call_agent_id: sales_user_id, // Attributed to sales agent
+            // Dummy values for required fields
+            grade: "Any",
+            manufacture_year: new Date().getFullYear(),
+            mileage_min: 0,
+            mileage_max: 0,
+            no_of_owners: 0,
+            price_from: 0,
+            price_to: 0
+        }, { transaction: t });
+
+        // 3. Create Placeholder Vehicle Listing
+        // We need a vehicle_id. Since we don't have a real inventory item yet, create a placeholder.
+        // Note: Ensure your 'VehicleListing' model allows duplicates or generate a unique pseudo-ID
+        const dummyVehicle = await VehicleListing.create({
+            make: vehicle_make,
+            model: vehicle_model,
+            type: vehicle_type || "Car",
+            price: 0,
+            // Dummy values
+            mileage: 0,
+            grade: "N/A",
+            manufacture_year: new Date().getFullYear(),
+            transmission: "AUTO", // Default
+            fuel_type: "PETROL", // Default
+            no_of_owners: 0,
+            capacity: "0",
+            color: "N/A",
+            vehicle_no: `TEMP-${Date.now()}` // Unique temp ID
+        }, { transaction: t });
+
+        // 4. Determine Level
+        let currentLevel = 1;
+        const salesUser = await User.findByPk(sales_user_id);
+        if (salesUser) {
+            currentLevel = getLevelFromRole(salesUser.user_role) as 1 | 2 | 3;
+        }
+
+        // 5. Create Sale Record
+        const newSale = await FastTrackSale.create({
+            ticket_number: `IMS${Date.now()}`,
+            customer_id: customer.id,
+            vehicle_id: dummyVehicle.id,
+            direct_request_id: dummyRequest.id,
+
+            call_agent_id: sales_user_id, // Created by this agent
+            assigned_sales_id: sales_user_id, // Assigned to this agent
+
+            status: "ONGOING",
+            current_level: currentLevel as 1 | 2 | 3,
+
+            price_range_min: 0,
+            price_range_max: 0,
+            additional_note: additional_note,
+            priority: priority || 0
+        }, { transaction: t });
+
+        // 6. Log History
+        await FastTrackSaleHistory.create({
+            fast_track_sale_id: newSale.id,
+            action_by: sales_user_id,
+            action_type: "CREATED_AND_SELF_ASSIGNED",
+            previous_level: 0,
+            new_level: currentLevel,
+            details: `Lead created and self-assigned by Sales Agent`,
+            timestamp: new Date()
+        } as any, { transaction: t });
+
+        await t.commit();
+        res.status(http.CREATED).json({ message: "Sale created successfully", sale: newSale });
+
+    } catch (error: any) {
+        await t.rollback();
+        console.error("createSaleDirect error:", error);
+        res.status(http.INTERNAL_SERVER_ERROR).json({ message: "Server error", detail: error.message });
+    }
+};
